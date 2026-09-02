@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IBVAP — Command Monitor</title>
+<style>
+  :root {
+    --bg: #0c0e12; --surface: #13171f; --border: #1e2433;
+    --text: #e2e8f0; --muted: #64748b;
+    --green: #22c55e; --red: #ef4444; --orange: #f97316;
+    --font: 'Inter', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font);
+         height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 0 18px; height: 52px; flex-shrink: 0;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .logo { font-size: 13px; font-weight: 700; letter-spacing: .12em; }
+  .logo span { color: var(--green); }
+  #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #conn-dot.live  { background: var(--green); box-shadow: 0 0 6px #22c55e66; }
+  #conn-dot.error { background: var(--red); }
+  #conn-label { font-size: 11px; color: var(--muted); }
+  .spacer { flex: 1; }
+
+  #stats { display: flex; gap: 15px; font-size: 11px; color: var(--muted);
+           font-variant-numeric: tabular-nums; margin-right: 14px; }
+  #stats .k { display: flex; flex-direction: column; line-height: 1.25; }
+  #stats .v { color: var(--text); font-weight: 600; font-size: 12px; }
+  #stats .lbl { font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+  #stats .gpu .v { color: var(--green); }
+  #stats .save .v { color: var(--orange); }
+  #clock { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  #model-switcher {
+    display: flex; align-items: center; gap: 4px; margin-right: 14px;
+    background: #181d27; padding: 3px 6px; border-radius: 20px;
+    border: 1px solid var(--border);
+  }
+  .ms-lbl { font-size: 9px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; font-weight: 700; margin-left: 4px; margin-right: 2px; }
+  .ms-btn {
+    font-size: 11px; font-weight: 700; padding: 3px 10px;
+    border-radius: 14px; border: 1px solid transparent;
+    background: transparent; color: var(--muted); cursor: pointer;
+    transition: all .15s ease;
+  }
+  .ms-btn:hover { color: var(--text); }
+  .ms-btn.active {
+    background: var(--green); color: #000;
+    box-shadow: 0 0 8px #22c55e44;
+  }
+  .ms-btn.switching {
+    background: var(--orange); color: #000;
+    animation: ms-pulse 1s infinite alternate;
+  }
+  @keyframes ms-pulse {
+    0% { opacity: 1; transform: scale(1); }
+    100% { opacity: 0.6; transform: scale(0.96); }
+  }
+
+  .body { display: flex; flex: 1; overflow: hidden; }
+
+  /* Single composited mosaic — one HTTP connection regardless of camera count */
+  #stage { flex: 1; position: relative; background: #05070a;
+           overflow: hidden; padding: 6px; }
+  #mosaic { position: absolute; inset: 6px; width: calc(100% - 12px);
+            height: calc(100% - 12px); object-fit: contain; display: block; }
+  #stage .empty { position: absolute; inset: 0; display: flex;
+                  flex-direction: column; align-items: center; justify-content: center;
+                  color: var(--muted); font-size: 13px; text-align: center;
+                  line-height: 1.9; }
+  [hidden] { display: none !important; }   /* author rules otherwise beat the attribute */
+  #stage .empty code { background: var(--surface); padding: 3px 8px;
+                       border-radius: 4px; color: var(--text); }
+
+  #side { width: 320px; flex-shrink: 0; background: var(--surface);
+          border-left: 1px solid var(--border); display: flex;
+          flex-direction: column; overflow: hidden; }
+  .panel { display: flex; flex-direction: column; overflow: hidden; }
+  .panel + .panel { border-top: 1px solid var(--border); }
+  .panel h2 { font-size: 11px; font-weight: 600; letter-spacing: .08em;
+              color: var(--muted); padding: 13px 15px 9px;
+              display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+  .panel h2 .pill { margin-left: auto; font-size: 10px; font-weight: 700;
+                    color: var(--text); background: #ffffff12; border-radius: 20px;
+                    padding: 1px 8px; }
+
+  #dev-panel { flex: 0 0 auto; }
+  #dev-list { overflow-y: auto; }
+  .dev { padding: 7px 15px; border-top: 1px solid var(--border);
+         font-size: 11px; line-height: 1.5; }
+  .dev:first-child { border-top: 0; }
+  .dev .top { display: flex; align-items: center; gap: 7px; }
+  .dev .d { width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
+            flex-shrink: 0; }
+  .dev.live    .d { background: var(--green); box-shadow: 0 0 5px #22c55e88; }
+  .dev.idle    .d { background: var(--orange); }
+  .dev.offline .d { background: var(--red); }
+  .dev .name { font-weight: 600; color: var(--text); overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap; }
+  .dev .lat { margin-left: auto; font-size: 9px; font-weight: 700;
+              font-variant-numeric: tabular-nums; padding: 1px 5px;
+              border-radius: 3px; }
+  .dev .lat.ok   { color: var(--green); background: #22c55e18; }
+  .dev .lat.warn { color: var(--orange); background: #f9731618; }
+  .dev .lat.bad  { color: #fff; background: var(--red); }
+  .dev .st { font-size: 9px; font-weight: 700;
+             letter-spacing: .05em; text-transform: uppercase; }
+  .dev.live    .st { color: var(--green); }
+  .dev.idle    .st { color: var(--orange); }
+  .dev.offline .st { color: var(--red); }
+  .dev .meta { color: var(--muted); font-variant-numeric: tabular-nums;
+               padding-left: 15px; }
+  .dev .meta b { color: #94a3b8; font-weight: 600; }
+  .empty-dev { padding: 20px 15px; color: var(--muted); font-size: 12px;
+               text-align: center; }
+
+  #log-panel { flex: 1; }
+  #log-list { flex: 1; overflow-y: auto; }
+  .log-item { padding: 9px 15px; border-top: 1px solid var(--border);
+              font-size: 11px; line-height: 1.5; }
+  .log-item .ll { font-weight: 700; }
+  .log-item .ll.Critical { color: var(--red); }
+  .log-item .ll.High     { color: var(--orange); }
+  .log-item .lm { color: var(--muted); margin-top: 2px; }
+  .empty-log { padding: 22px 15px; color: var(--muted); font-size: 12px;
+               text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">IB<span>VAP</span></div>
+  <div id="conn-dot"></div>
+  <span id="conn-label">Connecting…</span>
+  <div class="spacer"></div>
+  <div id="model-switcher">
+    <span class="ms-lbl">MODEL</span>
+    <button class="ms-btn active" id="ms-nano" data-profile="nano" onclick="switchModel('nano')">Nano</button>
+    <button class="ms-btn" id="ms-medium" data-profile="medium" onclick="switchModel('medium')">Medium</button>
+  </div>
+  <div id="stats"></div>
+  <span id="clock"></span>
+</header>
+
+<div class="body">
+  <div id="stage">
+    <img id="mosaic" alt="camera mosaic" hidden>
+    <div class="empty" id="empty">
+      No cameras streaming yet.<br>
+      Replay footage: <code>python feed_test.py --cams 8</code><br>
+      or open <code>https://&lt;lan-ip&gt;:8443/camera/0</code> on a phone.
+    </div>
+  </div>
+  <aside id="side">
+    <section class="panel" id="dev-panel">
+      <h2>CONNECTED DEVICES <span class="pill" id="dev-count">0</span></h2>
+      <div id="dev-list"><p class="empty-dev">No devices connected.</p></div>
+    </section>
+    <section class="panel" id="log-panel">
+      <h2>ALERT LOG</h2>
+      <div id="log-list"><p class="empty-log">No alerts yet.</p></div>
+    </section>
+  </aside>
+</div>
+
+<script>
+// Video: one composited MJPEG mosaic in a single <img> — N cameras, 1 connection.
+// Everything else (device list, risk badges, alerts) polls /status.
+const mosaic  = document.getElementById('mosaic');
+const emptyEl = document.getElementById('empty');
+const logList = document.getElementById('log-list');
+const devList = document.getElementById('dev-list');
+const devCount = document.getElementById('dev-count');
+const connDot = document.getElementById('conn-dot');
+const connLbl = document.getElementById('conn-label');
+const statsEl = document.getElementById('stats');
+const clock   = document.getElementById('clock');
+
+(function tick(){ clock.textContent = new Date().toLocaleTimeString(); setTimeout(tick, 1000); })();
+
+let mosaicStarted = false;
+const lastLevel = {};   // cam_id -> last risk level, for alert-log edges
+
+function startMosaic() {
+  if (!mosaicStarted) {
+    mosaicStarted = true;
+    mosaic.src = '/stream?' + Date.now();
+    mosaic.addEventListener('error', () => { mosaicStarted = false; }, { once: true });
+  }
+  // MJPEG streams don't fire 'load' reliably across browsers — reveal directly.
+  mosaic.hidden = false;
+  emptyEl.hidden = true;
+}
+
+function renderDevices(devs) {
+  devCount.textContent = devs.length;
+  if (!devs.length) {
+    devList.innerHTML = '<p class="empty-dev">No devices connected.</p>';
+    return;
+  }
+  devList.innerHTML = devs.map(d => {
+    const state = d.state || 'offline';
+    const cam = 'CAM-' + String(d.cam_id).padStart(2, '0');
+    const resized = d.resized ? ` · <b>resized</b> ${d.resized}` : '';
+    const lat = d.latency_ms || 0;
+    const latClass = lat >= 1500 ? 'lat bad' : lat >= 600 ? 'lat warn' : 'lat ok';
+    const latTxt = lat >= 1500 ? `${(lat / 1000).toFixed(1)}s DELAYED`
+                 : lat ? `${lat} ms` : '—';
+    return `<div class="dev ${state}">
+      <div class="top">
+        <span class="d"></span>
+        <span class="name">${d.label || cam}</span>
+        <span class="${latClass}">${latTxt}</span>
+        <span class="st">${state}</span>
+      </div>
+      <div class="meta"><b>${cam}</b> · ${d.negotiated} ·
+        <b>${(d.delivered_fps || 0).toFixed(0)}</b> fps in ·
+        gate ${(d.gate_skip_pct || 0).toFixed(0)}% skip${resized}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderStats(s) {
+  const p = s.pipeline || {};
+  const onGpu = s.device && s.device !== 'cpu';
+  statsEl.innerHTML = `
+    <div class="k gpu"><span class="v">${onGpu ? 'CUDA' : 'CPU'}</span><span class="lbl">device</span></div>
+    <div class="k"><span class="v">${(s.fps ?? 0).toFixed(0)}</span><span class="lbl">fps in</span></div>
+    <div class="k"><span class="v">${(p.mean_batch ?? 0).toFixed(1)}</span><span class="lbl">batch</span></div>
+    <div class="k"><span class="v">${(s.inference_ms ?? 0).toFixed(1)}</span><span class="lbl">ms/frame</span></div>
+    <div class="k save"><span class="v">${(p.gpu_saving_pct ?? 0).toFixed(0)}%</span><span class="lbl">gpu saved</span></div>
+    <div class="k"><span class="v">${s.frames_processed ?? 0}</span><span class="lbl">frames</span></div>`;
+}
+
+function addLog(camId, meta) {
+  const empty = logList.querySelector('.empty-log');
+  if (empty) empty.remove();
+  const item = document.createElement('div');
+  item.className = 'log-item';
+  item.innerHTML = `
+    <div><b>CAM-${String(camId).padStart(2,'0')}</b>
+         &nbsp;<span class="ll ${meta.level}">${meta.level.toUpperCase()}</span></div>
+    <div class="lm">Score ${meta.score.toFixed(1)} · P:${meta.persons} V:${meta.vehicles}
+         · ${new Date().toLocaleTimeString()}</div>`;
+  logList.prepend(item);
+  const items = logList.querySelectorAll('.log-item');
+  if (items.length > 60) items[items.length - 1].remove();
+}
+
+let isSwitching = false;
+
+async function switchModel(profile) {
+  if (isSwitching) return;
+  const btn = document.getElementById('ms-' + profile);
+  if (btn && btn.classList.contains('active')) return;
+
+  document.querySelectorAll('.ms-btn').forEach(b => {
+    b.classList.remove('active', 'switching');
+  });
+  if (btn) btn.classList.add('switching');
+  isSwitching = true;
+
+  try {
+    const res = await fetch('/api/switch-model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile })
+    });
+    if (!res.ok) {
+      console.error('Failed to request switch', await res.text());
+      isSwitching = false;
+    }
+  } catch (e) {
+    console.error('Error switching model', e);
+    isSwitching = false;
+  }
+}
+
+function updateModelUI(activeModel, switching) {
+  if (switching) {
+    isSwitching = true;
+    return;
+  }
+  isSwitching = false;
+  const normalized = (activeModel || '').toLowerCase();
+  const current = (normalized.includes('medium') || normalized.includes('26m')) ? 'medium' : 'nano';
+
+  document.querySelectorAll('.ms-btn').forEach(b => {
+    b.classList.remove('active', 'switching');
+    if (b.dataset.profile === current) {
+      b.classList.add('active');
+    }
+  });
+}
+
+async function poll() {
+  try {
+    const s = await (await fetch('/status', { cache: 'no-store' })).json();
+    connDot.className = 'live';
+    connLbl.textContent = 'Live';
+    renderStats(s);
+    renderDevices(s.devices || []);
+    updateModelUI(s.active_model, s.switching);
+
+    const camIds = Object.keys(s.meta || {}).map(Number);
+    if (camIds.length) startMosaic();
+
+    for (const camId of camIds) {
+      const meta = s.meta[camId];
+      if (meta.level !== 'Normal' && lastLevel[camId] !== meta.level) addLog(camId, meta);
+      lastLevel[camId] = meta.level;
+    }
+  } catch (e) {
+    connDot.className = 'error';
+    connLbl.textContent = 'Reconnecting…';
+  }
+  setTimeout(poll, 500);
+}
+
+poll();
+</script>
+</body>
+</html>

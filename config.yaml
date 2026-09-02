@@ -1,0 +1,140 @@
+# ── Stream sources ───────────────────────────────────────────────────────────
+# Used by main.py (local OpenCV mode). The web server (server.py) accepts any
+# camera id that connects to /ws/camera/{id}, so mobile phones and replayed
+# footage appear dynamically there without being listed here.
+#   - "http://192.168.x.x:8080/video"  → Android IP Webcam app (MJPEG)
+#   - "rtsp://192.168.x.x:8554/stream" → any RTSP source
+#   - "0", "1", "2"                    → laptop/USB webcam index
+#   - path to a .mp4 / .avi file       → offline testing
+streams:
+  - id: 0
+    name: "CAM-01"
+    url: "0"
+    zone_sensitivity: 0.8   # 0.0–1.0; higher = more sensitive zone
+  - id: 1
+    name: "CAM-02"
+    url: "1"
+    zone_sensitivity: 0.5
+
+# ── Ingest / mobile devices ──────────────────────────────────────────────────
+# A phone browser opens https://<lan-ip>:8443/camera/<id>, is asked for
+# 1280x720@24, and streams JPEG frames over a WebSocket. Phones rarely honour
+# the exact request, so every incoming frame is rescaled to this size before it
+# reaches the pipeline — downstream code never sees a non-standard resolution.
+ingest:
+  normalise_width: 1280
+  normalise_height: 720
+
+# ── Model profiles (for live switching from the dashboard) ────────────────────
+# Each profile overrides model.weights and pose.weights when selected.
+# Switch via POST /api/switch-model {"profile": "nano"} or from the UI.
+model_profiles:
+  nano:
+    label:         "Nano (2.6M, 40.9 mAP)"
+    det_weights:   "yolo26n.pt"        # ~5.5 MB; auto-downloaded
+    pose_weights:  "yolo26n-pose.pt"   # ~7.5 MB; already downloaded
+    max_batch:     16
+  medium:
+    label:         "Medium (20.4M, 53.1 mAP)"
+    det_weights:   "yolo26m.pt"        # ~42 MB; auto-downloaded
+    pose_weights:  "yolo26m-pose.pt"   # ~60 MB; auto-downloaded
+    max_batch:     8                   # lower batch cap for 6 GB VRAM safety
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  weights: "yolo26n.engine"   # TensorRT 10.13 FP16 engine, built for this GPU by
+                          # export_engine.py. Fixed input shape (max_batch, 3, imgsz, imgsz);
+                          # the detector pads short batches to it. Inference runs on its own
+                          # worker thread (server.py) so the ~15-28 ms GPU call never blocks
+                          # the 24 Hz muxer — measured: 8 mobile streams at 192 fps, GPU ~37%.
+                          #
+                          # Fall back to "yolo26n.pt" only if the .engine is missing (not
+                          # yet exported on this machine) or a non-CUDA box. The .engine is
+                          # hardware-specific: re-run export_engine.py per GPU. See CLAUDE.md.
+  confidence: 0.40        # raised from 0.25 (benchmark default) — reduces false-positive alert fatigue
+  iou: 0.50
+  device: "0"             # "0" = GPU 0 (CUDA); "cpu" = CPU only (slow but works)
+  image_size: 640
+  half: true              # FP16 on CUDA — roughly 2x throughput on an RTX 3050
+
+
+  # ── Throughput controls ─────────────────────────────────────────────────────
+  # server.py runs an nvstreammux-style muxer: every camera's queue is drained
+  # continuously into a one-deep slot, and on a fixed tick (1 / stream_fps) the
+  # whole set of live slots goes to the model in ONE forward pass. The batch is
+  # then always "every connected camera", which is what makes the GPU cost
+  # sub-linear in camera count. Measured on an RTX 3050: batch of 1 = 12.3 ms,
+  # batch of 8 ≈ 18 ms — per-pass overhead dominates, so filling the batch is
+  # the whole game. (The old batch_window_ms setting is obsolete — the fixed
+  # tick replaced the collect-with-timeout approach.)
+  max_batch: 8            # max frames per batched call. Also the TensorRT engine's
+                          # dynamic-batch profile ceiling (export_engine.py reads this).
+                          # 8 covers the 8-stream target; raising it needs a re-export
+                          # and more VRAM during the TRT build.
+
+  # Detection runs at detect_fps while tracks are carried on every frame by
+  # linear extrapolation, so boxes stay smooth between detector passes.
+  stream_fps: 24          # source frame rate — also the muxer tick rate
+  detect_fps: 8           # detector passes per second per camera
+
+  # Cheap pre-filter: a static scene never reaches the GPU at all. This is also
+  # what drives the dashboard's live/idle state per device — "idle" means the
+  # gate below is currently skipping that stream, so no YOLO/ByteTrack runs.
+  # Lower pixel_threshold / area_threshold = more sensitive (more frames pass).
+  motion_gating: true
+  motion:
+    pixel_threshold: 18   # per-pixel intensity delta counted as change
+    area_threshold: 0.002 # fraction of pixels that must change (0.2%)
+    # The gate is only consulted on frames that already cleared the rate cap,
+    # so these counts are in gate calls, not raw frames. At detect_fps 8,
+    # force_every 8 means a static camera is still swept once per second.
+    force_every: 8        # always detect at least this often, regardless
+    hold_frames: 3        # keep the gate open briefly after motion stops
+
+# ── Pose / skeleton anomaly detection ────────────────────────────────────────
+# Runs yolo26n-pose.pt on person bounding-box crops after the detection pass.
+# Set enabled: false to disable without touching any Python code.
+pose:
+  enabled: true
+  weights: "yolo26n-pose.pt"   # auto-downloaded by Ultralytics on first run (~6.5 MB)
+  kp_conf: 0.5                 # joints below this visibility score are ignored
+  # Geometry thresholds — tune per deployment environment
+  lying_ratio:    0.35   # skeleton height/width ratio below this → lying
+  crouch_ratio:   0.60   # body height < 60% of standing baseline → crouching
+  knee_hip_delta: 30     # px: knee within this of hip.y → crouching
+  scan_window:    10     # frames of nose_x history for vigorous-scan detection
+  scan_std:       12.0   # px std-dev of nose_x to flag vigorous scan
+  arms_up_margin: 20     # px wrist must be above shoulder line to count as raised
+  # Rule 5 — weapon-ready posture (2D-skeleton heuristic, NOT gun detection).
+  # A detected AIM forces the risk level to Critical (see risk_engine). Tuned to
+  # catch a real two-handed gun hold; loosen if aim stances are missed, tighten
+  # if innocent two-handed poses (phone, mug) trip it. See src/posture.py Rule 5.
+  aim_band_above:     0.60   # wrist band top    = 0.60 * body-height above the shoulder line (≈ forehead)
+  aim_band_below:     0.55   # wrist band bottom = 0.55 * body-height below the shoulder line (≈ navel)
+  aim_wrist_sep:      0.85   # hands within 0.85 * shoulder-width of each other
+  aim_wrist_level:    0.60   # hands within 0.60 * shoulder-width of the same height
+  aim_center_margin:  0.55   # hands within 0.55 * shoulder-width of the shoulder span (in front of the torso)
+  aim_wrist_above_hip: 0.10  # each hand at least 0.10 * body-height above the hip (arms off the thighs)
+  aim_hold_frames:    2      # raw geometry must persist this many detection frames before AIM fires
+
+
+# ── Risk scoring ──────────────────────────────────────────────────────────────
+risk:
+  threshold_critical: 70
+  threshold_high: 50
+  weights:
+    zone: 0.40
+    time_of_day: 0.20
+    behaviour: 0.40
+
+# ── Display ───────────────────────────────────────────────────────────────────
+display:
+  grid_cols: 3            # max columns in the multi-stream grid
+  cell_width: 640         # each stream cell width in pixels
+  cell_height: 360        # each stream cell height in pixels
+
+# ── Evidence / storage ────────────────────────────────────────────────────────
+evidence:
+  db_path: "data/events.db"
+  hash_chain_path: "data/hash_chain.jsonl"
+  log_level: "High"       # log events at this level and above ("High" or "Critical")

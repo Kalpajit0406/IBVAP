@@ -1,0 +1,42 @@
+# ── Model weights & exports ─────────────────────────────────────────────────
+# .pt weights auto-download on first run (Ultralytics); the .engine is
+# hardware-specific and must be re-exported per GPU (python export_engine.py).
+*.pt
+*.engine
+*.onnx
+
+# ── Generated test media ────────────────────────────────────────────────────
+# Rebuild with:  python make_test_videos.py
+test_videos/
+test_input.*
+*_detected.*
+
+# ── TLS (regenerate: python gen_cert.py) ────────────────────────────────────
+cert.pem
+key.pem
+
+# ── Runtime data ────────────────────────────────────────────────────────────
+data/
+*.db
+*.jsonl
+
+# ── cloudflared credentials (never commit) ──────────────────────────────────
+*.cloudflared/
+cloudflared.yml
+!cloudflared.example.yml
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+nohup.out

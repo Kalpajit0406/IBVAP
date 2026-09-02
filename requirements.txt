@@ -1,0 +1,21 @@
+# Install PyTorch separately first:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+ultralytics==8.4.137   # pinned — YOLO26n, NMS-free head; bump deliberately, not via auto-upgrade
+supervision>=0.22.0
+opencv-python>=4.10.0
+pyyaml>=6.0
+numpy>=1.24.0
+
+# Web server mode (server.py)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+aiofiles>=23.0.0
+websockets>=12.0            # feed_test.py / loadtest_mobile.py phone stand-ins
+qrcode>=7.4              # tunnel.py QR for the phone link (ASCII, no PIL needed)
+
+# TensorRT engine export (export_engine.py) — the pipeline default is
+# yolo26n.engine. GPU only. Pin to 10.x: 11.x removed the builder API
+# Ultralytics 8.4 uses. cu12 must match torch's cu126.
+#   pip install "tensorrt-cu12==10.13.3.9" onnx onnxslim
+# Then: python export_engine.py   (hardware-specific, re-run per GPU)

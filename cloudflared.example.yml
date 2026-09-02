@@ -1,0 +1,27 @@
+# cloudflared named-tunnel config for IBVAP.
+#
+# Copy this to cloudflared's config dir so `cloudflared tunnel run <name>` finds
+# it automatically:
+#     Windows : %USERPROFILE%\.cloudflared\config.yml
+#     Linux   : ~/.cloudflared/config.yml
+# ...or point at it explicitly:  python tunnel.py --named ibvap --cf-config .\cloudflared.example.yml
+#
+# Fill in the two <PLACEHOLDERS> from the one-time setup in docs/CUSTOM_DOMAIN.md
+# (`cloudflared tunnel create ibvap` prints the UUID and the credentials path).
+
+tunnel: <TUNNEL-UUID-OR-NAME>
+credentials-file: C:\Users\<you>\.cloudflared\<TUNNEL-UUID>.json
+
+# Route the subdomain to the local HTTP dashboard port. The tunnel carries the
+# camera WebSocket (/ws/camera/N) on the same hostname automatically.
+ingress:
+  - hostname: stream.mathswithsd.in
+    service: http://localhost:8090
+  # everything else on this tunnel gets a 404
+  - service: http_status:404
+
+# Notes:
+#  * Use the HTTP port 8090, not 8443 — Cloudflare terminates TLS at its edge
+#    with a real cert, so the phone sees a valid https:// with no warning.
+#  * originRequest defaults are fine; add "noTLSVerify: true" only if you ever
+#    point service: at https://localhost:8443 instead.

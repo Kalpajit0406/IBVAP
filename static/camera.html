@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>IBVAP · CAM-{{CAM_ID}}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0a0a; color: #e5e5e5; font-family: system-ui, sans-serif;
+         height: 100dvh; display: flex; flex-direction: column; }
+  #preview { width: 100%; flex: 1; object-fit: cover; background: #111; }
+  canvas { display: none; }
+  #bar { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+         background: #111; border-top: 1px solid #222; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0;
+         background: #555; transition: background .3s; }
+  .dot.live  { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+  .dot.error { background: #ef4444; }
+  .dot.wait  { background: #eab308; }
+  .dot.warn  { background: #f97316; box-shadow: 0 0 6px #f9731688; }
+  #status { font-size: 13px; color: #aaa; }
+  #camtag { margin-left: auto; font-size: 12px; font-weight: 600; color: #555;
+            letter-spacing: .05em; }
+  #detail { padding: 8px 16px 14px; background: #111; font-size: 11px;
+            color: #777; font-variant-numeric: tabular-nums; line-height: 1.6; }
+  #detail b { color: #aaa; font-weight: 600; }
+  #startbtn { position: fixed; inset: 0; margin: auto; width: 200px; height: 56px;
+              background: #22c55e; color: #052e12; border: 0; border-radius: 10px;
+              font-size: 16px; font-weight: 700; display: none; }
+</style>
+</head>
+<body>
+<video id="preview" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+<button id="startbtn">Start camera</button>
+<div id="bar">
+  <div class="dot wait" id="dot"></div>
+  <span id="status">Starting camera…</span>
+  <span id="camtag">CAM-{{CAM_ID}}</span>
+</div>
+<div id="detail">—</div>
+
+<script>
+const CAM_ID  = {{CAM_ID}};
+const REQ_W = 1280, REQ_H = 720, REQ_FPS = 24;
+
+// ── Uplink budget ────────────────────────────────────────────────────────────
+// A mobile uplink is often 1–5 Mbps. 720p JPEG @ 24fps is ~10 Mbps, so the
+// WebSocket send buffer grows without bound and every frame the server sees is
+// seconds old. We therefore: downscale before encoding, cap the send rate, and
+// — the key fix — NEVER queue a frame while the socket already has one pending.
+const SEND_W_MAX = 960;         // longest edge of the frame we transmit
+const SEND_FPS_HI = 20;         // when the link is keeping up
+const SEND_FPS_LO = 10;         // when it is congested
+const Q_HI = 0.55, Q_LO = 0.40; // JPEG quality, ditto
+const MAX_BUFFERED = 96 * 1024; // ~one frame; above this we skip capture entirely
+
+const preview  = document.getElementById('preview');
+const canvas   = document.getElementById('canvas');
+const ctx      = canvas.getContext('2d', { alpha: false });
+const dot      = document.getElementById('dot');
+const statusEl = document.getElementById('status');
+const detailEl = document.getElementById('detail');
+const startBtn = document.getElementById('startbtn');
+
+let ws = null, negotiated = null, sendTimer = null, syncTimer = null;
+let clockOffset = 0;            // serverTime ≈ Date.now() + clockOffset
+let congested = false, skipStreak = 0, sentSinceTick = 0;
+let sendW = SEND_W_MAX, sendH = SEND_W_MAX * 9 / 16;
+
+function setStatus(text, state) { dot.className = 'dot ' + state; statusEl.textContent = text; }
+
+function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${location.host}/ws/camera/${CAM_ID}`;
+}
+
+function sendHello() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !negotiated) return;
+  ws.send(JSON.stringify({
+    type: 'hello', kind: 'mobile',
+    label: `${negotiated.facing || 'cam'} · ${navigator.platform || 'phone'}`,
+    reqWidth: REQ_W, reqHeight: REQ_H, reqFps: REQ_FPS,
+    width: negotiated.width, height: negotiated.height, fps: negotiated.fps,
+    t0: Date.now(),                     // for server→client clock sync
+  }));
+}
+
+function connect() {
+  setStatus('Connecting to server…', 'wait');
+  ws = new WebSocket(wsUrl());
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setStatus(`Streaming — CAM-${String(CAM_ID).padStart(2,'0')}`, 'live'); sendHello(); };
+  ws.onclose = () => { setStatus('Disconnected — retrying in 2 s…', 'error'); ws = null; setTimeout(connect, 2000); };
+  ws.onerror = () => setStatus('Connection error', 'error');
+  ws.onmessage = (ev) => {
+    // Server replies to the hello with its clock; one-way delay (~tens of ms)
+    // is folded in as a small constant, fine for a lag indicator.
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'synced' && typeof m.serverTime === 'number' && typeof m.t0 === 'number') {
+        const rtt = Date.now() - m.t0;
+        clockOffset = m.serverTime + rtt / 2 - Date.now();
+      }
+    } catch (_) {}
+  };
+}
+
+// One binary message per frame: [8-byte LE capture time in ms | JPEG bytes]
+function packFrame(jpegBuf) {
+  const out = new Uint8Array(8 + jpegBuf.byteLength);
+  new DataView(out.buffer).setBigUint64(0, BigInt(Date.now()), true);
+  out.set(new Uint8Array(jpegBuf), 8);
+  return out;
+}
+
+function sendFrame() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || preview.readyState < 2) return;
+
+  // Backpressure: if the socket still holds the previous frame, the uplink is
+  // behind. Skip this capture rather than pile on — this is what keeps latency
+  // flat instead of growing to several seconds.
+  if (ws.bufferedAmount > MAX_BUFFERED) {
+    skipStreak++;
+    if (skipStreak === 6 && !congested) { congested = true; applyRate(); }
+    updateDetail();
+    return;
+  }
+  if (skipStreak > 0 && ws.bufferedAmount < MAX_BUFFERED / 3) {
+    skipStreak = 0;
+    if (congested) { congested = false; applyRate(); }
+  }
+
+  ctx.drawImage(preview, 0, 0, sendW, sendH);
+  canvas.toBlob(blob => {
+    if (!blob || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > MAX_BUFFERED) return;      // re-check: toBlob is async
+    blob.arrayBuffer().then(buf => {
+      if (ws && ws.readyState === WebSocket.OPEN) { ws.send(packFrame(buf)); sentSinceTick++; }
+    });
+  }, 'image/jpeg', congested ? Q_LO : Q_HI);
+}
+
+function applyRate() {
+  if (sendTimer) clearInterval(sendTimer);
+  const fps = congested ? SEND_FPS_LO : SEND_FPS_HI;
+  sendTimer = setInterval(sendFrame, 1000 / fps);
+  setStatus(congested ? 'Link busy — reducing rate' : `Streaming — CAM-${String(CAM_ID).padStart(2,'0')}`,
+            congested ? 'warn' : 'live');
+  updateDetail();
+}
+
+let lastRateReport = performance.now();
+function updateDetail() {
+  const n = negotiated || {};
+  const now = performance.now();
+  const dt = (now - lastRateReport) / 1000;
+  const outFps = dt > 0 ? sentSinceTick / dt : 0;
+  if (dt >= 1) { sentSinceTick = 0; lastRateReport = now; }
+  const buffKB = ws ? (ws.bufferedAmount / 1024).toFixed(0) : '0';
+  detailEl.innerHTML =
+    `<b>send</b> ${sendW}×${Math.round(sendH)} @ ${(congested ? SEND_FPS_LO : SEND_FPS_HI)}fps ` +
+    `q${congested ? Q_LO : Q_HI} &nbsp;·&nbsp; <b>out</b> ~${outFps.toFixed(0)}fps ` +
+    `&nbsp;·&nbsp; <b>buffer</b> ${buffKB} KB${congested ? ' ⚠' : ''}<br>` +
+    `<b>negotiated</b> ${n.width || '?'}×${n.height || '?'} @ ${(n.fps || 0).toFixed(0)}fps ` +
+    `(server normalises to 1280×720)`;
+}
+setInterval(updateDetail, 1000);
+
+async function start() {
+  startBtn.style.display = 'none';
+  setStatus('Requesting camera…', 'wait');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' },
+               width: { ideal: REQ_W }, height: { ideal: REQ_H },
+               frameRate: { ideal: REQ_FPS } },
+      audio: false,
+    });
+    preview.srcObject = stream;
+    await new Promise(r => (preview.onloadedmetadata = r));
+
+    const track = stream.getVideoTracks()[0];
+    const s = track.getSettings ? track.getSettings() : {};
+    negotiated = {
+      width:  s.width  || preview.videoWidth  || REQ_W,
+      height: s.height || preview.videoHeight || REQ_H,
+      fps:    s.frameRate || REQ_FPS,
+      facing: s.facingMode || 'environment',
+    };
+
+    // Send canvas: downscale so the longest edge is <= SEND_W_MAX, keep aspect.
+    const ar = negotiated.width / negotiated.height;
+    if (ar >= 1) { sendW = Math.min(SEND_W_MAX, negotiated.width);  sendH = Math.round(sendW / ar); }
+    else         { sendH = Math.min(SEND_W_MAX, negotiated.height); sendW = Math.round(sendH * ar); }
+    canvas.width = sendW; canvas.height = sendH;
+
+    connect();
+    applyRate();
+    syncTimer = setInterval(sendHello, 10000);   // re-sync clock + refresh hello
+    updateDetail();
+  } catch (e) {
+    setStatus('Camera error: ' + e.message, 'error');
+    startBtn.textContent = 'Retry';
+    startBtn.style.display = 'block';
+  }
+}
+
+startBtn.onclick = start;
+
+if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+  start().catch(() => { startBtn.style.display = 'block'; });
+} else {
+  setStatus('getUserMedia unavailable — this page must be served over HTTPS', 'error');
+}
+</script>
+</body>
+</html>
