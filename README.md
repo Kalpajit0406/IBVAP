@@ -26,6 +26,9 @@ SHA-256 hash-chained evidence log.
   WebSocket, adaptive to uplink backpressure, with a per-stream latency badge.
 - **Posture rules** — lying / crouch / scan / arms-up / two-handed weapon-ready
   grip (the last forces a Critical alert).
+- **ANPR** — YOLOv8 plate detector on vehicle crops + threaded EasyOCR, Indian
+  plate-format cleanup, logged to a CSV and the hash-chained evidence trail.
+  (Ported from [anindya-mukhopadhyay/ANPR](https://github.com/anindya-mukhopadhyay/ANPR), MIT.)
 - **Off-LAN access** — `tunnel.py` (ngrok or cloudflared), including your own
   domain via a cloudflared named tunnel (see `docs/CUSTOM_DOMAIN.md`).
 
@@ -54,6 +57,7 @@ python run_demo.py --cams 4
 |---|---|
 | `server.py` | FastAPI: WS + RTSP intake, muxer + inference-worker threads, MJPEG mosaic, `/status` |
 | `src/rtsp_capture.py` | CCTV/RTSP/NVR puller — one decode thread per camera, TCP, auto-reconnect |
+| `src/anpr.py` | number-plate recognition — plate detector on vehicle crops + threaded EasyOCR |
 | `rtsp_probe.py` · `discover_cameras.py` | validate a camera URL · find ONVIF cameras on the LAN |
 | `src/detector.py` | batched YOLO26n + per-camera ByteTrack + track carry-forward + pose pass |
 | `src/motion_gate.py` | frame-difference pre-filter |

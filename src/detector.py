@@ -53,6 +53,8 @@ class Detection:
     is_vehicle: bool
     velocity: tuple[float, float] = (0.0, 0.0)   # px/frame, for extrapolation
     posture: Optional[PostureFlags] = None        # set by pose pass; None on non-persons
+    plate: Optional[str] = None                   # set by ANPR on vehicles
+    plate_conf: float = 0.0
 
 
 @dataclass
@@ -115,8 +117,13 @@ class Detector:
     """One YOLO model shared by every camera; per-camera tracker and motion gate."""
 
     @classmethod
-    def from_profile(cls, config: dict, profile: str, num_cameras: int = 0) -> "Detector":
-        """Build a Detector using a named model_profiles entry."""
+    def from_profile(cls, config: dict, profile: str, num_cameras: int = 0,
+                     anpr=None) -> "Detector":
+        """Build a Detector using a named model_profiles entry.
+
+        `anpr` — pass an existing AnprEngine to reuse it across a hot-swap
+        instead of spinning up a second EasyOCR reader.
+        """
         profiles = config.get("model_profiles", {})
         if profile not in profiles:
             raise ValueError(f"Unknown profile {profile!r}. Available: {list(profiles)}")
@@ -127,9 +134,9 @@ class Detector:
         patched["model"]["max_batch"] = p.get("max_batch", patched["model"].get("max_batch", 8))
         patched.setdefault("pose", {})
         patched["pose"]["weights"] = p["pose_weights"]
-        return cls(patched, num_cameras=num_cameras)
+        return cls(patched, num_cameras=num_cameras, anpr=anpr)
 
-    def __init__(self, config: dict, num_cameras: int = 0) -> None:
+    def __init__(self, config: dict, num_cameras: int = 0, anpr=None) -> None:
         m = config["model"]
         self._weights = str(m["weights"])
         # A TensorRT .engine (or .onnx) is already bound to its device and only
@@ -142,6 +149,25 @@ class Detector:
         self._imgsz = m.get("image_size", 640)
         self._half = bool(m.get("half", False))
         self._max_batch = int(m.get("max_batch", 16))
+
+        # ── Detection scope + per-class confidence ──────────────────────────
+        # Restrict inference to the classes we care about (person + 4 vehicle
+        # types) — cleaner output, a touch less NMS. Then a per-class floor:
+        # a lower bar for people (they are what matters most) and a higher bar
+        # for vehicles (cuts parked-car / reflection false positives).
+        self._classes = list(m.get("classes", [_PERSON, *sorted(_VEHICLES)]))
+        self._person_conf = float(m.get("person_conf", 0.30))
+        self._vehicle_conf = float(m.get("vehicle_conf", 0.40))
+        # predict() floor = the lowest per-class bar, refined afterwards.
+        self._predict_conf = min(self._conf, self._person_conf, self._vehicle_conf)
+
+        tk = config.get("tracker", {}) or {}
+        self._tracker_kwargs = {
+            "track_activation_threshold": float(tk.get("activation_conf", 0.25)),
+            "lost_track_buffer": int(tk.get("lost_buffer_frames", 60)),
+            "minimum_matching_threshold": float(tk.get("match_thresh", 0.85)),
+            "frame_rate": max(1, int(float(m.get("detect_fps", 8.0)))),
+        }
 
         # Detection rate: how many detector passes per second per camera.
         # Streams run at 24-25 fps; detecting at 8 is plenty when tracking
@@ -207,6 +233,17 @@ class Detector:
             self._classifier = None
             logger.info("Pose estimation disabled (pose.enabled: false)")
 
+        # ── ANPR (off unless anpr.enabled and easyocr installed) ─────────────
+        anpr_cfg = config.get("anpr", {}) or {}
+        if anpr is not None:
+            self.anpr = anpr                       # reused across a hot-swap
+        elif anpr_cfg.get("enabled"):
+            from .anpr import AnprEngine
+            eng = AnprEngine(anpr_cfg, device=self._device)
+            self.anpr = eng if eng.available else None
+        else:
+            self.anpr = None
+
         logger.info(
             "Detector ready: %s | device=%s | imgsz=%d | conf=%.2f | fp16=%s | "
             "detect every %d frames (%.0f fps of %.0f) | motion gating=%s | "
@@ -267,10 +304,17 @@ class Detector:
     def device(self) -> str:
         return self._device
 
+    def _new_tracker(self) -> "sv.ByteTrack":
+        try:
+            return sv.ByteTrack(**self._tracker_kwargs)
+        except TypeError:
+            # Older supervision: different kwarg names — fall back to defaults.
+            return sv.ByteTrack()
+
     def _cam(self, cam_id: int) -> _CamState:
         st = self._cams.get(cam_id)
         if st is None:
-            st = _CamState(tracker=sv.ByteTrack(),
+            st = _CamState(tracker=self._new_tracker(),
                            gate=MotionGate(**self._gate_kwargs))
             self._cams[cam_id] = st
             logger.info("CAM-%02d registered with the pipeline", cam_id)
@@ -367,8 +411,9 @@ class Detector:
         # An engine's precision is baked in at build time; passing quantize= to
         # it makes Ultralytics do extra per-call work and adds latency jitter
         # (measured: p90 39 ms -> 31 ms, max 66 ms -> 33 ms at batch 8).
-        predict_kw = dict(conf=self._conf, iou=self._iou, device=self._device,
-                          imgsz=self._imgsz, verbose=False)
+        predict_kw = dict(conf=self._predict_conf, iou=self._iou,
+                          device=self._device, imgsz=self._imgsz,
+                          classes=self._classes, verbose=False)
         if not self._is_engine:
             predict_kw["quantize"] = 16 if self._half else None
 
@@ -395,6 +440,17 @@ class Detector:
         st.infer_count += 1
 
         sv_det = sv.Detections.from_ultralytics(out)
+
+        # Per-class confidence floor (see __init__). Filter BEFORE the tracker
+        # so it never opens a track on a low-confidence or off-target box.
+        if len(sv_det):
+            keep = np.fromiter(
+                ((c == _PERSON and cf >= self._person_conf) or
+                 (c in _VEHICLES and cf >= self._vehicle_conf)
+                 for c, cf in zip(sv_det.class_id, sv_det.confidence)),
+                dtype=bool, count=len(sv_det))
+            sv_det = sv_det[keep]
+
         sv_det = st.tracker.update_with_detections(sv_det)
 
         detections: list[Detection] = []
@@ -449,6 +505,21 @@ class Detector:
                           if t not in live_tids]:
                 self._classifier.flush_track(stale)
 
+        # ── ANPR on vehicle crops (async — never blocks this thread) ──────────
+        if self.anpr is not None:
+            veh_boxes = [(*d.bbox, d.track_id) for d in detections
+                         if d.is_vehicle and d.track_id >= 0]
+            if veh_boxes:
+                self.anpr.submit(cam_id, frame, veh_boxes, self._tick)
+                reads = self.anpr.readings_for_cam(cam_id)
+                for d in detections:
+                    if d.is_vehicle and d.track_id in reads:
+                        r = reads[d.track_id]
+                        d.plate, d.plate_conf = r.text, r.conf
+                live_veh = {tid for *_, tid in veh_boxes}
+                for tid in [t for t in list(reads) if t not in live_veh]:
+                    self.anpr.flush_track(tid)
+
         return StreamResult(
             cam_id, ts, frame, detections, st.person_count, st.vehicle_count,
             self._annotate(frame, detections), inferred=True,
@@ -476,6 +547,7 @@ class Detector:
                 (max(nx1, 0), max(ny1, 0), min(nx2, w), min(ny2, h)),
                 d.confidence, d.is_person, d.is_vehicle, d.velocity,
                 posture=d.posture,   # carry last known pose — dimmed in draw_skeleton
+                plate=d.plate, plate_conf=d.plate_conf,
             ))
 
         return StreamResult(
@@ -509,6 +581,15 @@ class Detector:
             # Skeleton overlay on persons that have pose data
             if d.is_person and d.posture is not None:
                 draw_skeleton(canvas, d.posture, dim=dim)
+            # Number plate under a vehicle box
+            if d.is_vehicle and d.plate:
+                pl = f"{d.plate}  {d.plate_conf:.0%}"
+                (pw, ph), _ = cv2.getTextSize(pl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                py = min(y2 + ph + 6, canvas.shape[0] - 2)
+                cv2.rectangle(canvas, (x1, py - ph - 5), (x1 + pw + 8, py + 2),
+                              (0, 215, 255), -1)
+                cv2.putText(canvas, pl, (x1 + 4, py - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (15, 15, 15), 2, cv2.LINE_AA)
         return canvas
 
     # ── Introspection ────────────────────────────────────────────────────────

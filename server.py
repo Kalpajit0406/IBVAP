@@ -428,6 +428,9 @@ async def status():
         },
         "buffered_bgr": {cid: True for cid in _latest_bgr},
         "meta": _camera_meta,
+        "anpr": (_detector.anpr.status()
+                 if _detector is not None and getattr(_detector, "anpr", None)
+                 else {"enabled": False}),
     })
 
 
@@ -560,7 +563,8 @@ def _inference_worker() -> None:
             _stats["switching"] = True
             old_det = detector
             try:
-                new_det = Detector.from_profile(cfg, profile, num_cameras=0)
+                new_det = Detector.from_profile(cfg, profile, num_cameras=0,
+                                                anpr=getattr(old_det, "anpr", None))
                 detector = new_det
                 _detector = detector
                 _stats["device"] = detector.device
@@ -651,6 +655,11 @@ def _inference_worker() -> None:
                     for d in sr.detections
                     if d.is_person and d.posture is not None and d.posture.any_anomaly
                 ],
+                "plates": [
+                    {"track": d.track_id, "text": d.plate,
+                     "conf": round(d.plate_conf, 2)}
+                    for d in sr.detections if d.is_vehicle and d.plate
+                ],
             }
 
             # Draw the overlay and stash the annotated frame. NO JPEG encoding
@@ -685,6 +694,15 @@ def _inference_worker() -> None:
                     _broadcast(json.dumps(_camera_meta[sr.cam_id])), _loop)
                 fut.add_done_callback(_log_broadcast_error)
                 _stats["broadcasts"] += 1
+
+        # Confirmed number plates → the hash-chained evidence log.
+        if detector.anpr is not None:
+            for pr in detector.anpr.drain_events():
+                ev = {"cam_id": pr.cam_id, "type": "plate", "plate": pr.text,
+                      "confidence": round(pr.conf, 2), "verified": pr.valid,
+                      "track": pr.track_id}
+                h = evidence.append(ev)
+                store.log(pr.cam_id, "Plate", pr.conf * 100, 0, 1, ev, h)
 
 
 def _draw_label(img, text: str, org, scale: float, colour) -> None:

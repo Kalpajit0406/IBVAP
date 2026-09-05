@@ -86,11 +86,20 @@ model:
                           # Fall back to "yolo26n.pt" only if the .engine is missing (not
                           # yet exported on this machine) or a non-CUDA box. The .engine is
                           # hardware-specific: re-run export_engine.py per GPU. See CLAUDE.md.
-  confidence: 0.40        # raised from 0.25 (benchmark default) — reduces false-positive alert fatigue
+  confidence: 0.40        # generic fallback bar; per-class floors below refine it
   iou: 0.50
   device: "0"             # "0" = GPU 0 (CUDA); "cpu" = CPU only (slow but works)
   image_size: 640
   half: true              # FP16 on CUDA — roughly 2x throughput on an RTX 3050
+
+  # ── Detection scope + per-class confidence ─────────────────────────────────
+  # Inference is restricted to these COCO ids (person, car, motorcycle, bus,
+  # truck) — cleaner output, slightly less NMS, no "chair / handbag" boxes.
+  classes: [0, 2, 3, 5, 7]
+  # Then a per-class floor: a LOWER bar for people (they matter most, we want
+  # recall) and a HIGHER bar for vehicles (kills parked-car / reflection FPs).
+  person_conf:  0.30
+  vehicle_conf: 0.40
 
 
   # ── Throughput controls ─────────────────────────────────────────────────────
@@ -125,6 +134,32 @@ model:
     # force_every 8 means a static camera is still swept once per second.
     force_every: 8        # always detect at least this often, regardless
     hold_frames: 3        # keep the gate open briefly after motion stops
+
+# ── Tracker (ByteTrack) ─────────────────────────────────────────────────────
+# Tuned for CCTV: people walk behind pillars / vehicles, so tracks must coast
+# a good while before being dropped. frame_rate is taken from model.detect_fps.
+tracker:
+  activation_conf:     0.25   # a detection must clear this to (re)start a track
+  lost_buffer_frames:  60     # keep a lost track alive this many detection frames (~7 s at 8 fps)
+  match_thresh:        0.85   # IoU-distance match gate (higher = stricter re-association)
+
+# ── ANPR — number-plate recognition ─────────────────────────────────────────
+# Two-stage: a YOLOv8 plate detector (models/license_plate_detector.pt, MIT,
+# github.com/anindya-mukhopadhyay/ANPR) runs on each vehicle crop, then EasyOCR
+# reads it on a background thread. Needs:  pip install easyocr
+# If easyocr or the weights are missing the engine disables itself with a
+# warning — the rest of the pipeline is unaffected. See docs/ANPR.md.
+anpr:
+  enabled: true
+  weights: "models/license_plate_detector.pt"
+  region: "IN"            # plate-format check: IN = Indian (SS RR L(L)(L) NNNN). "XX" = generic.
+  yolo_conf: 0.30         # plate-detector confidence
+  ocr_min_conf: 0.20      # min mean OCR confidence to log a plate to data/plates/plates.csv
+  min_plate_area: 300     # px² — ignore specks
+  plate_detect_every: 3   # run the plate detector every Nth detection tick (~2.7 fps)
+  plate_imgsz: 320        # plate-detector input size (plates are small → small + fast)
+  cooldown_s: 8           # don't re-log the same plate string within this window
+  workers: 1              # EasyOCR worker threads (1 is plenty for a few vehicles)
 
 # ── Pose / skeleton anomaly detection ────────────────────────────────────────
 # Runs yolo26n-pose.pt on person bounding-box crops after the detection pass.

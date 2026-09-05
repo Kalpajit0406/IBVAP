@@ -227,6 +227,7 @@ src/
 ├── motion_gate.py  # MotionGate: cheap frame-difference pre-filter in front of the GPU
 ├── detector.py     # Detector: batched YOLO26n + per-camera ByteTrack + track carry-forward + pose pass
 ├── posture.py      # PoseEstimator (yolo26n-pose on person crops) + PoseClassifier geometry rules
+├── anpr.py         # AnprEngine: YOLOv8 plate detector on vehicle crops + threaded EasyOCR
 ├── risk_engine.py  # RiskEngine: zone × time_of_day × behaviour → 0–100 score
 ├── evidence.py     # EvidenceChain: append-only SHA-256 hash-chain JSONL
 ├── event_store.py  # EventStore: SQLite store-and-forward (survives network outage)
@@ -275,6 +276,42 @@ Human Verify → Confirm → Intercept Dispatch
 False-alarm dismissals feed an Active Learning retrain loop back into the AI pipeline.
 
 ---
+
+## Detection tuning (person / vehicle)
+
+- **Class-restricted inference** — `model.classes: [0, 2, 3, 5, 7]` passed to
+  `predict()` so YOLO only ever emits person + car/motorcycle/bus/truck. Cleaner
+  output, a touch less NMS, no stray `chair`/`handbag` boxes.
+- **Per-class confidence floors** — `predict(conf=…)` is set to the *lowest*
+  bar, then `_finish_detection` filters `sv.Detections` **before the tracker**:
+  keep a person at `model.person_conf` (0.30 — favour recall, people matter
+  most), a vehicle at `model.vehicle_conf` (0.40 — higher bar kills
+  parked-car / reflection false positives). The tracker never opens an ID on a
+  weak or off-target box.
+- **ByteTrack tuned for CCTV** (`tracker:` block) — `lost_track_buffer` 60
+  detection frames (~7 s at 8 fps) so a person walking behind a pillar keeps
+  their ID; `minimum_matching_threshold` 0.85. Falls back to library defaults
+  on an older `supervision`.
+- The **`medium` profile** (`yolo26m` / `yolo26m-pose`, 53.1 mAP) is one click
+  away in the dashboard for when accuracy matters more than headroom.
+
+## ANPR — number-plate recognition (`src/anpr.py`)
+
+Two-stage, ported from
+[github.com/anindya-mukhopadhyay/ANPR](https://github.com/anindya-mukhopadhyay/ANPR)
+(MIT): a YOLOv8 `license_plate` model (`models/license_plate_detector.pt`,
+committed) runs on each **vehicle crop** the main detector already produced —
+every 3rd detection tick, and not on a vehicle that already has a confident
+reading — then **EasyOCR** reads the plate on a **background worker thread** so
+it never touches the real-time budget. `region: IN` coerces the common
+`O/0 I/1 B/8 S/5` confusions into a valid `SS RR L(L)(L) NNNN` and marks it
+verified. Output: a tag under the vehicle box, `data/plates/plates.csv` + a
+crop image, a `{"type":"plate"}` record in the hash-chained evidence log, a
+yellow `PLATE` row in the dashboard alert log, and `/status.anpr`.
+
+`anpr.enabled: true` by default; needs `pip install easyocr`. If easyocr or the
+weights are missing, `AnprEngine` logs one warning and disables itself — the
+rest of the pipeline is unaffected. Full guide + tuning: **`docs/ANPR.md`**.
 
 ## Posture / behaviour analysis (`src/posture.py`)
 
@@ -389,7 +426,7 @@ warm-up pass; keep it that way.
 |---|---|---|
 | Detection | **YOLO26n** (Ultralytics ≥8.3.0) | 40.9 mAP, 1.7 ms T4 TRT, 2.4M params |
 | Tracker | **ByteTrack** | 80.3 MOTA; faster than DeepSORT, default in Ultralytics pipeline |
-| ANPR | EasyOCR (primary) / PaddleOCR (fallback) | On cropped vehicle regions only, not full frame |
+| ANPR | YOLOv8 plate detector + EasyOCR (`src/anpr.py`) | Live. On vehicle crops only; threaded OCR. `docs/ANPR.md` |
 | Face detection | RetinaFace | Detection only — no live matching in demo |
 | Re-ID | OSNet | Architecture/roadmap target; demo uses timestamp + visual heuristic |
 | Backend | FastAPI + WebSocket + PostgreSQL/PostGIS | |
@@ -486,6 +523,10 @@ hardware-specific): `python export_engine.py` — reads `image_size` and
   forward grip. Do not call it "gun detection". A custom-trained YOLO weapon
   class is the real capability.
 - Per-endpoint auth (camera intake, dashboard, tunnel link are all currently open)
+- **Plate-specific OCR + multi-frame voting.** ANPR is live (`src/anpr.py`) but
+  it's single-frame EasyOCR with per-position `O/0` coercion — good for the demo
+  evidence trail, not production accuracy. A plate-trained OCR model and
+  temporal voting are the upgrade.
 
 ---
 

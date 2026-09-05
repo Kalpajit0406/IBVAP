@@ -4,6 +4,9 @@
 *.pt
 *.engine
 *.onnx
+# ...but DO ship the ANPR plate detector — it's a custom fine-tune, not
+# something Ultralytics can auto-download (6 MB, MIT). See models/README.md.
+!models/license_plate_detector.pt
 
 # ── Generated test media ────────────────────────────────────────────────────
 # Rebuild with:  python make_test_videos.py

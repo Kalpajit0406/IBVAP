@@ -176,6 +176,19 @@ phones (§6) or your own video files: `python feed_test.py --src "C:\my\clips" -
 
 Either way you end up with a `test_videos\` folder.
 
+### 4b½. ANPR — number-plate recognition (optional)
+
+On by default (`anpr.enabled: true`). It needs EasyOCR:
+
+```powershell
+pip install easyocr
+```
+
+~200 MB of dependencies; the first plate read downloads ~64 MB of OCR models.
+If you skip this, `AnprEngine` logs one warning at startup and everything else
+runs normally. The plate detector weights (`models/license_plate_detector.pt`)
+are already in the repo. Details + tuning: `docs/ANPR.md`.
+
 ### 4c. TensorRT engine — optional, ~2× faster inference
 
 The pipeline runs fine on `yolo26n.pt` (PyTorch). For the faster path:

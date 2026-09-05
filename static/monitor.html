@@ -240,7 +240,10 @@ function renderStats(s) {
     <div class="k"><span class="v">${(p.mean_batch ?? 0).toFixed(1)}</span><span class="lbl">batch</span></div>
     <div class="k"><span class="v">${(s.inference_ms ?? 0).toFixed(1)}</span><span class="lbl">ms/frame</span></div>
     <div class="k save"><span class="v">${(p.gpu_saving_pct ?? 0).toFixed(0)}%</span><span class="lbl">gpu saved</span></div>
-    <div class="k"><span class="v">${s.frames_processed ?? 0}</span><span class="lbl">frames</span></div>`;
+    <div class="k"><span class="v">${s.frames_processed ?? 0}</span><span class="lbl">frames</span></div>` +
+    ((s.anpr && s.anpr.enabled)
+      ? `<div class="k"><span class="v" style="color:#f5c518">${s.anpr.plates_logged ?? 0}</span><span class="lbl">plates</span></div>`
+      : '');
 }
 
 function addLog(camId, meta) {
@@ -257,6 +260,23 @@ function addLog(camId, meta) {
   const items = logList.querySelectorAll('.log-item');
   if (items.length > 60) items[items.length - 1].remove();
 }
+
+function addPlateLog(camId, text, conf, valid) {
+  const empty = logList.querySelector('.empty-log');
+  if (empty) empty.remove();
+  const item = document.createElement('div');
+  item.className = 'log-item';
+  item.innerHTML = `
+    <div><b>CAM-${String(camId).padStart(2,'0')}</b>
+         &nbsp;<span class="ll" style="color:#f5c518">PLATE</span></div>
+    <div class="lm"><b style="color:#f5c518;letter-spacing:.06em">${text}</b>
+         ${(conf*100).toFixed(0)}%${valid ? '' : ' (unverified)'}
+         · ${new Date().toLocaleTimeString()}</div>`;
+  logList.prepend(item);
+  const items = logList.querySelectorAll('.log-item');
+  if (items.length > 60) items[items.length - 1].remove();
+}
+const seenPlates = new Set();
 
 let isSwitching = false;
 
@@ -321,6 +341,17 @@ async function poll() {
       if (meta.level !== 'Normal' && lastLevel[camId] !== meta.level) addLog(camId, meta);
       lastLevel[camId] = meta.level;
     }
+
+    // ANPR: log each newly-read plate once
+    const anpr = s.anpr || {};
+    for (const p of (anpr.active || [])) {
+      const key = p.cam + '|' + p.plate;
+      if (!seenPlates.has(key) && p.conf >= 0.20) {
+        seenPlates.add(key);
+        addPlateLog(p.cam, p.plate, p.conf, p.valid);
+      }
+    }
+    if (seenPlates.size > 400) seenPlates.clear();
   } catch (e) {
     connDot.className = 'error';
     connLbl.textContent = 'Reconnecting…';

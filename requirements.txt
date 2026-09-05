@@ -18,6 +18,12 @@ qrcode>=7.4              # tunnel.py QR for the phone link (ASCII, no PIL needed
 # is stdlib; this is only needed to auto-resolve each camera's RTSP URL:
 #   pip install onvif-zeep
 
+# ANPR — number-plate recognition (src/anpr.py, anpr.enabled in config.yaml).
+# ~200 MB of deps (Pillow, scikit-image, shapely, pyclipper). If it's not
+# installed the ANPR engine disables itself and the rest of the pipeline is
+# unaffected.
+easyocr>=1.7.0
+
 # TensorRT engine export (export_engine.py) — the pipeline default is
 # yolo26n.engine. GPU only. Pin to 10.x: 11.x removed the builder API
 # Ultralytics 8.4 uses. cu12 must match torch's cu126.
