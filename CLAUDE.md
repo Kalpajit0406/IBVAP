@@ -58,9 +58,33 @@ Two listeners share one app and one detection loop. Port 8080 is deliberately
 avoided — Steam's webhelper squats on it and silently answers requests instead
 of the server.
 
+## CCTV / RTSP ingestion (`src/rtsp_capture.py`)
+
+`server.py` opens every entry in `config.yaml` `streams:` on startup, **in the
+same process and pipeline as the phones**. A row with a real `url`
+(`rtsp://…`, `http://…mjpg`, a webcam index, or a `.mp4` to loop) becomes an
+`RtspCapture`; a row with `url: ws` (or no url) stays a WebSocket slot a phone
+connects to. Both land in the `captures` dict and flow through the batched
+muxer → detector → dashboard identically — an NVR channel and a phone are
+indistinguishable downstream.
+
+`RtspCapture` is built for real, flaky cameras: **one decode thread each** (a
+frozen camera never stalls the muxer), **RTSP forced over TCP** with a 5 s
+socket timeout, **`grab()` every loop but `retrieve()` (decode) only at
+`cctv.decode_fps`** (15) to keep CPU cost low across 8–10 streams,
+**auto-reconnect with backoff + a stall watchdog**, per-frame **resolution
+normalise** to 1280×720, and **credential redaction** in every log line and in
+`/status` / `/devices`. `POST /api/reconnect/<id>` force-cycles a frozen feed.
+It is duck-compatible with `WebSocketCapture` (`.read()`, `.connected`,
+`.info()`, `.latency_ms`, …) so nothing else changed.
+
+Full operator guide — how college CCTV is wired, vendor RTSP URL tables,
+main vs sub-stream, what to ask IT for, `rtsp_probe.py` /
+`discover_cameras.py` — is **`docs/CCTV_INTEGRATION.md`**.
+
 ## Mobile ingestion (phones as demo cameras)
 
-Up to 8 phones stream into the same pipeline as any RTSP source — no app install.
+Phones stream into that same pipeline — no app install.
 
 **How a phone connects.** It opens `https://<lan-ip>:8443/camera/<id>` (or
 `/cam/<id>`) in its browser. `static/camera.html` calls `getUserMedia`, reads
@@ -197,7 +221,8 @@ cost one HTTP connection — browsers cap at ~6 per host, which stalled tiles at
 
 ```
 src/
-├── capture.py      # StreamCapture: threaded, auto-reconnecting per-camera capture
+├── capture.py      # StreamCapture: threaded auto-reconnecting capture (used by main.py)
+├── rtsp_capture.py # RtspCapture: CCTV/RTSP/NVR puller for server.py — decode thread, TCP, reconnect
 ├── ws_capture.py   # WebSocketCapture: browser/replay frames; generation-guarded reconnect
 ├── motion_gate.py  # MotionGate: cheap frame-difference pre-filter in front of the GPU
 ├── detector.py     # Detector: batched YOLO26n + per-camera ByteTrack + track carry-forward + pose pass
@@ -206,7 +231,9 @@ src/
 ├── evidence.py     # EvidenceChain: append-only SHA-256 hash-chain JSONL
 ├── event_store.py  # EventStore: SQLite store-and-forward (survives network outage)
 └── display.py      # GridDisplay: OpenCV multi-stream grid with risk overlay
-server.py           # FastAPI: WS intake, muxer + inference-worker threads, MJPEG mosaic, /status, /devices
+server.py           # FastAPI: WS + RTSP intake, muxer + inference-worker threads, MJPEG mosaic, /status
+rtsp_probe.py       # Validate one camera/NVR URL: open time, res/fps/codec, jitter, verdict
+discover_cameras.py # ONVIF WS-Discovery: list LAN cameras, print a paste-ready streams: block
 tunnel.py           # Off-LAN phones: ngrok / cloudflared quick tunnel, or --named for your own domain
 cloudflared.example.yml # Named-tunnel ingress template (custom domain) — see docs/CUSTOM_DOMAIN.md
 run_demo.py         # One command: server + replay + browser  (--tunnel adds a public link)

@@ -1,20 +1,55 @@
 # ── Stream sources ───────────────────────────────────────────────────────────
-# Used by main.py (local OpenCV mode). The web server (server.py) accepts any
-# camera id that connects to /ws/camera/{id}, so mobile phones and replayed
-# footage appear dynamically there without being listed here.
-#   - "http://192.168.x.x:8080/video"  → Android IP Webcam app (MJPEG)
-#   - "rtsp://192.168.x.x:8554/stream" → any RTSP source
-#   - "0", "1", "2"                    → laptop/USB webcam index
-#   - path to a .mp4 / .avi file       → offline testing
+# server.py opens every entry here on startup, alongside phones:
+#   - url: rtsp://user:pass@ip:554/...   → a CCTV camera / NVR channel (pulled)
+#   - url: http://ip/video.mjpg          → an MJPEG camera or IP-Webcam app
+#   - url: "0" / "1"                     → a local USB/laptop webcam index
+#   - url: path\to\clip.mp4              → a video file (looped) — offline testing
+#   - url: ws   (or omit url)            → a slot a phone connects to via /cam/N
+# `zone_sensitivity` 0.0–1.0 feeds the risk score. `enabled: false` skips a row.
+# `transport` / `decode_fps` override the `cctv:` defaults per camera.
+#
+# ── Real CCTV: how to fill this in ──────────────────────────────────────────
+# Colleges usually give you NVR access (one IP + login, several channels), not
+# per-camera IPs. Use the sub-stream (low-res) for analytics. Full guide +
+# vendor URL table: docs/CCTV_INTEGRATION.md. Test a URL first:
+#   python rtsp_probe.py "rtsp://user:pass@10.0.0.50:554/..."
+# Discover cameras on the LAN:  python discover_cameras.py
+#
+#   Hikvision  main : rtsp://user:pass@IP:554/Streaming/Channels/101
+#              sub  : rtsp://user:pass@IP:554/Streaming/Channels/102
+#              (NVR: 101/201/301… = ch1/ch2/ch3 main, 102/202… = sub)
+#   Dahua/CP+  main : rtsp://user:pass@IP:554/cam/realmonitor?channel=1&subtype=0
+#              sub  : rtsp://user:pass@IP:554/cam/realmonitor?channel=1&subtype=1
+#   Axis            : rtsp://user:pass@IP/axis-media/media.amp?resolution=640x360
+#   Uniview         : rtsp://user:pass@IP:554/media/video2      (video1=main)
+#   generic ONVIF   : ask the camera via discover_cameras.py — paths vary
+#
+# Example — 4 NVR channels, sub-stream (delete/replace with your college's):
+# streams:
+#   - { id: 0, name: "Gate",     url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/102", zone_sensitivity: 0.9 }
+#   - { id: 1, name: "Corridor", url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/202", zone_sensitivity: 0.6 }
+#   - { id: 2, name: "Parking",  url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/302", zone_sensitivity: 0.7 }
+#   - { id: 3, name: "Perimeter",url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/402", zone_sensitivity: 0.9 }
+
 streams:
   - id: 0
-    name: "CAM-01"
-    url: "0"
-    zone_sensitivity: 0.8   # 0.0–1.0; higher = more sensitive zone
+    name: "Phone-0"
+    url: "ws"               # phone slot — open https://<ip>:8443/cam/0
+    zone_sensitivity: 0.8
   - id: 1
-    name: "CAM-02"
-    url: "1"
+    name: "Phone-1"
+    url: "ws"
     zone_sensitivity: 0.5
+
+# ── CCTV / RTSP defaults ─────────────────────────────────────────────────────
+# Applied to every pulled stream unless the stream overrides them.
+cctv:
+  transport: tcp          # tcp = reliable (recommended). udp = lower latency, tears on loss.
+  decode_fps: 15          # frames actually decoded per camera. Detection is 8 fps;
+                          # 10–15 is plenty and keeps CPU decode cost down with many cams.
+  reconnect_delay: 3.0    # seconds to wait before retrying a dropped stream
+  stall_timeout: 8.0      # no frame for this long → drop and reconnect
+  open_timeout: 8.0       # give up opening a stream after this long
 
 # ── Ingest / mobile devices ──────────────────────────────────────────────────
 # A phone browser opens https://<lan-ip>:8443/camera/<id>, is asked for

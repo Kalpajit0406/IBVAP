@@ -275,6 +275,52 @@ named tunnel).
 
 ---
 
+## 6½. Connect real CCTV cameras
+
+You'll usually be given **NVR access** (one IP + login, several channels), not
+per-camera IPs. Every NVR/DVR/IP-camera speaks **RTSP** — that's all IBVAP
+needs. Use each camera's **sub-stream** (low-res), not the main recording
+stream.
+
+1. **Find them** (optional):
+
+   ```powershell
+   pip install onvif-zeep
+   python discover_cameras.py --user admin --pass <pw>
+   ```
+
+   Prints the cameras on the LAN and a ready-to-paste `streams:` block.
+
+2. **Test each URL** before trusting it:
+
+   ```powershell
+   python rtsp_probe.py "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/102"
+   ```
+
+   Tells you if it opens, its resolution/fps, and whether it's a good analytics
+   stream. (`vlc "<url>"` also works as a quick check.)
+
+3. **Add them to `config.yaml`** — replace the `- { id: 0, ... url: "ws" ... }`
+   phone rows (or add alongside them):
+
+   ```yaml
+   streams:
+     - { id: 0, name: "Main Gate", url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/102", zone_sensitivity: 0.9 }
+     - { id: 1, name: "Corridor",  url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/202", zone_sensitivity: 0.6 }
+   ```
+
+   `config.yaml` already lists the RTSP URL patterns for Hikvision, Dahua, Axis,
+   Uniview, etc. in comments.
+
+4. **Run** `python server.py` — each camera opens on its own thread,
+   auto-reconnects, and shows on the dashboard as `kind: rtsp` with its live fps
+   and reconnect count. Kick a frozen feed with a `POST /api/reconnect/<id>`.
+
+Full guide (how CCTV is wired, vendor URL tables, what to ask college IT for,
+VLAN/firewall notes, troubleshooting): **`docs/CCTV_INTEGRATION.md`**.
+
+---
+
 ## 7. Verify the install
 
 ```powershell

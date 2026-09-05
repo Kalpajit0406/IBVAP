@@ -19,6 +19,9 @@ SHA-256 hash-chained evidence log.
   reaches the GPU (~80 % of frames skipped on real footage).
 - **TensorRT FP16 engine** (`yolo26n.engine`) — the default backend, 4.8× the
   batch-1 latency of PyTorch.
+- **Real CCTV ingestion** — RTSP / NVR channels / ONVIF cameras pulled on their
+  own decode threads (TCP, auto-reconnect, stall watchdog), in the same process
+  and pipeline as the phones. `rtsp_probe.py` + `discover_cameras.py` to set up.
 - **Phone ingestion with latency control** — browser `getUserMedia` → JPEG over
   WebSocket, adaptive to uplink backpressure, with a per-stream latency badge.
 - **Posture rules** — lying / crouch / scan / arms-up / two-handed weapon-ready
@@ -49,7 +52,9 @@ python run_demo.py --cams 4
 
 | path | |
 |---|---|
-| `server.py` | FastAPI: WS intake, muxer + inference-worker threads, MJPEG mosaic, `/status` |
+| `server.py` | FastAPI: WS + RTSP intake, muxer + inference-worker threads, MJPEG mosaic, `/status` |
+| `src/rtsp_capture.py` | CCTV/RTSP/NVR puller — one decode thread per camera, TCP, auto-reconnect |
+| `rtsp_probe.py` · `discover_cameras.py` | validate a camera URL · find ONVIF cameras on the LAN |
 | `src/detector.py` | batched YOLO26n + per-camera ByteTrack + track carry-forward + pose pass |
 | `src/motion_gate.py` | frame-difference pre-filter |
 | `src/posture.py` | pose model on person crops + geometry rules |
@@ -59,6 +64,19 @@ python run_demo.py --cams 4
 | `feed_test.py` · `loadtest_mobile.py` · `benchmark.py` · `diagnose.py` | test / measure tools |
 | `tunnel.py` · `cloudflared.example.yml` | off-LAN phone access |
 | `config.yaml` | streams, model, throughput, risk, pose thresholds |
+
+## Connecting real CCTV
+
+```bash
+python discover_cameras.py --user admin --pass <pw>     # find ONVIF cameras on the LAN
+python rtsp_probe.py "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/102"   # test one URL
+```
+
+Then add the (sub-stream) URLs to `config.yaml` `streams:` and run
+`python server.py`. Full guide — how CCTV/NVRs are wired, vendor URL tables,
+what to ask college IT for — is **`docs/CCTV_INTEGRATION.md`**.
+
+## Deep docs
 
 **`CLAUDE.md` has the full architecture, measured numbers, and design rationale.**
 Model weights, the TensorRT engine, generated test videos, the TLS cert and

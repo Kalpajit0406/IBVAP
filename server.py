@@ -44,6 +44,7 @@ from src.detector import Detector
 from src.event_store import EventStore
 from src.evidence import EvidenceChain
 from src.risk_engine import RiskEngine
+from src.rtsp_capture import RtspCapture, redact
 from src.ws_capture import WebSocketCapture
 
 # Windows consoles default to cp1252 and mangle non-ASCII log output
@@ -105,13 +106,58 @@ async def _lifespan(app: FastAPI):
         ing = cfg.get("ingest", {}) or {}
         NORM_W = int(ing.get("normalise_width", NORM_W))
         NORM_H = int(ing.get("normalise_height", NORM_H))
-        for s in cfg.get("streams", []):
-            captures[s["id"]] = WebSocketCapture(s["id"], norm_w=NORM_W, norm_h=NORM_H)
+        _open_configured_streams()
         threading.Thread(target=_inference_worker, daemon=True, name="infer").start()
         threading.Thread(target=_muxer_loop, daemon=True, name="muxer").start()
         logger.info("IBVAP ready — muxer + inference worker started "
                     "(ingest normalised to %dx%d)", NORM_W, NORM_H)
-    yield
+    try:
+        yield
+    finally:
+        for cap in list(captures.values()):
+            try:
+                cap.stop()
+            except Exception:
+                pass
+
+
+# Values in a stream's `url` that mean "a phone will connect here" rather than
+# "pull this source". Empty / missing also means a phone slot.
+_WS_URLS = {"", "ws", "phone", "mobile", "browser"}
+
+
+def _open_configured_streams() -> None:
+    """Turn config.yaml `streams:` into live captures.
+
+    A stream with a real `url` (rtsp://, http://, a webcam index, a file) is
+    pulled by an RtspCapture on its own decode thread. A stream with no url —
+    or url: ws — is a WebSocketCapture slot a phone can connect to. Both land
+    in the same `captures` dict and flow through the same batched pipeline.
+    """
+    c = cfg.get("cctv", {}) or {}
+    for s in cfg.get("streams", []):
+        cam_id = int(s["id"])
+        if not s.get("enabled", True):
+            logger.info("CAM-%02d disabled in config — skipping", cam_id)
+            continue
+        url = str(s.get("url", "")).strip()
+        if url.lower() in _WS_URLS:
+            captures[cam_id] = WebSocketCapture(cam_id, norm_w=NORM_W, norm_h=NORM_H)
+            continue
+        try:
+            captures[cam_id] = RtspCapture(
+                cam_id, url,
+                name=s.get("name"),
+                norm_w=NORM_W, norm_h=NORM_H,
+                transport=str(s.get("transport", c.get("transport", "tcp"))),
+                decode_fps=float(s.get("decode_fps", c.get("decode_fps", 15))),
+                reconnect_delay=float(c.get("reconnect_delay", 3.0)),
+                stall_timeout=float(c.get("stall_timeout", 8.0)),
+                open_timeout=float(c.get("open_timeout", 8.0)),
+            ).start()
+        except Exception as e:
+            logger.error("CAM-%02d failed to start (%s): %s",
+                         cam_id, redact(url), e)
 
 
 app = FastAPI(title="IBVAP", lifespan=_lifespan)
@@ -303,6 +349,19 @@ def _device_rows() -> list[dict]:
 async def devices():
     from fastapi.responses import JSONResponse
     return JSONResponse({"count": len(captures), "devices": _device_rows()})
+
+
+@app.post("/api/reconnect/{cam_id}", status_code=202)
+async def reconnect_camera(cam_id: int):
+    """Force an RTSP camera to drop and reopen — for a frozen feed mid-demo."""
+    from fastapi.responses import JSONResponse
+    cap = captures.get(cam_id)
+    if cap is None or not hasattr(cap, "request_reconnect"):
+        return JSONResponse({"error": f"CAM-{cam_id:02d} is not a pullable camera"},
+                            status_code=400)
+    cap.request_reconnect()
+    logger.info("CAM-%02d reconnect requested via API", cam_id)
+    return {"reconnecting": cam_id}
 
 
 @app.post("/api/switch-model", status_code=202)

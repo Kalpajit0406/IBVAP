@@ -55,7 +55,17 @@ def main() -> None:
             sys.exit(1)
         return
 
-    streams_cfg = cfg["streams"]
+    # Local OpenCV mode only pulls real sources — skip phone (ws) slots and
+    # anything marked disabled. Use server.py for the phone / web pipeline.
+    _WS = {"", "ws", "phone", "mobile", "browser"}
+    streams_cfg = [s for s in cfg["streams"]
+                   if s.get("enabled", True)
+                   and str(s.get("url", "")).strip().lower() not in _WS]
+    if not streams_cfg:
+        print("No pullable streams in config.yaml (all are phone/ws slots or "
+              "disabled).\nAdd rtsp:// / webcam / file entries, or run "
+              "'python server.py' for the phone pipeline.")
+        return
     log_from = cfg["evidence"].get("log_level", "High")
 
     # ── Start capture threads ─────────────────────────────────────────────────
